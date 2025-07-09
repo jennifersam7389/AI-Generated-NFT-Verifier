@@ -8,6 +8,8 @@
 
 (define-data-var next-verification-id uint u1)
 (define-data-var verification-fee uint u1000000)
+(define-data-var next-batch-id uint u1)
+(define-data-var batch-discount-rate uint u10)
 
 (define-map verified-nfts
     { contract-address: principal, token-id: uint }
@@ -54,6 +56,29 @@
         status: (string-ascii 20),
         created-at: uint,
         fee-paid: uint
+    }
+)
+
+(define-map batch-verification-requests
+    uint
+    {
+        requester: principal,
+        ai-model-requested: (string-ascii 50),
+        nft-count: uint,
+        status: (string-ascii 20),
+        created-at: uint,
+        total-fee-paid: uint,
+        completed-count: uint
+    }
+)
+
+(define-map batch-nft-items
+    { batch-id: uint, item-index: uint }
+    {
+        contract-address: principal,
+        token-id: uint,
+        verification-id: uint,
+        is-completed: bool
     }
 )
 
@@ -160,6 +185,128 @@
     )
 )
 
+(define-public (request-batch-verification (nft-list (list 50 { contract-address: principal, token-id: uint })) (ai-model (string-ascii 50)))
+    (let (
+        (batch-id (var-get next-batch-id))
+        (nft-count (len nft-list))
+        (base-fee (var-get verification-fee))
+        (discount-rate (var-get batch-discount-rate))
+        (discount-amount (/ (* base-fee nft-count discount-rate) u100))
+        (total-fee (- (* base-fee nft-count) discount-amount))
+        (block-height-current stacks-block-height)
+    )
+        (asserts! (is-some (map-get? ai-models ai-model)) ERR_INVALID_AI_MODEL)
+        (asserts! (> nft-count u1) ERR_INVALID_METADATA)
+        (asserts! (<= nft-count u50) ERR_INVALID_METADATA)
+        (try! (stx-transfer? total-fee tx-sender (as-contract tx-sender)))
+        (map-set batch-verification-requests batch-id {
+            requester: tx-sender,
+            ai-model-requested: ai-model,
+            nft-count: nft-count,
+            status: "pending",
+            created-at: block-height-current,
+            total-fee-paid: total-fee,
+            completed-count: u0
+        })
+        (var-set next-batch-id (+ batch-id u1))
+        (fold store-single-nft-item nft-list u0)
+        (ok batch-id)
+    )
+)
+
+
+
+(define-private (store-single-nft-item (nft-item { contract-address: principal, token-id: uint }) (current-index uint))
+    (let (
+        (batch-id (- (var-get next-batch-id) u1))
+        (verification-id (var-get next-verification-id))
+    )
+        (map-set batch-nft-items { batch-id: batch-id, item-index: current-index } {
+            contract-address: (get contract-address nft-item),
+            token-id: (get token-id nft-item),
+            verification-id: verification-id,
+            is-completed: false
+        })
+        (var-set next-verification-id (+ verification-id u1))
+        (+ current-index u1)
+    )
+)
+
+(define-public (submit-batch-verification-item
+    (batch-id uint)
+    (item-index uint)
+    (ai-model (string-ascii 50))
+    (confidence-score uint)
+    (metadata-hash (buff 32))
+)
+    (let (
+        (verifier-data (default-to 
+            { reputation-score: u0, total-verifications: u0, successful-verifications: u0, is-certified: false, certification-date: u0 }
+            (map-get? verifier-credentials tx-sender)
+        ))
+        (model-data (unwrap! (map-get? ai-models ai-model) ERR_INVALID_AI_MODEL))
+        (batch-data (unwrap! (map-get? batch-verification-requests batch-id) ERR_NOT_FOUND))
+        (nft-item (unwrap! (map-get? batch-nft-items { batch-id: batch-id, item-index: item-index }) ERR_NOT_FOUND))
+        (is-verified (>= confidence-score (get accuracy-threshold model-data)))
+        (contract-address (get contract-address nft-item))
+        (token-id (get token-id nft-item))
+        (verification-id (get verification-id nft-item))
+        (new-completed-count (+ (get completed-count batch-data) u1))
+        (is-batch-complete (is-eq new-completed-count (get nft-count batch-data)))
+        (new-status (if is-batch-complete "completed" "in-progress"))
+    )
+        (asserts! (get is-certified verifier-data) ERR_UNAUTHORIZED)
+        (asserts! (get is-active model-data) ERR_INVALID_AI_MODEL)
+        (asserts! (not (is-eq (get status batch-data) "completed")) ERR_VERIFICATION_FAILED)
+        (asserts! (not (get is-completed nft-item)) ERR_ALREADY_EXISTS)
+        (asserts! (and (>= confidence-score u0) (<= confidence-score u100)) ERR_INVALID_METADATA)
+        (asserts! (is-none (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })) ERR_ALREADY_EXISTS)
+        
+        (map-set verified-nfts 
+            { contract-address: contract-address, token-id: token-id }
+            {
+                verification-id: verification-id,
+                ai-model: ai-model,
+                confidence-score: confidence-score,
+                verifier: tx-sender,
+                timestamp: stacks-block-height,
+                metadata-hash: metadata-hash,
+                is-verified: is-verified
+            }
+        )
+        
+        (map-set batch-nft-items { batch-id: batch-id, item-index: item-index }
+            (merge nft-item { is-completed: true })
+        )
+        
+        (map-set batch-verification-requests batch-id 
+            (merge batch-data { 
+                completed-count: new-completed-count,
+                status: new-status 
+            })
+        )
+        
+        (map-set verifier-credentials tx-sender {
+            reputation-score: (get reputation-score verifier-data),
+            total-verifications: (+ (get total-verifications verifier-data) u1),
+            successful-verifications: (+ (get successful-verifications verifier-data) (if is-verified u1 u0)),
+            is-certified: true,
+            certification-date: (get certification-date verifier-data)
+        })
+        
+        (ok is-verified)
+    )
+)
+
+(define-public (update-batch-discount-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-rate u50) ERR_INVALID_METADATA)
+        (var-set batch-discount-rate new-rate)
+        (ok true)
+    )
+)
+
 (define-public (update-verification-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -227,6 +374,40 @@
 (define-read-only (get-verification-confidence (contract-address principal) (token-id uint))
     (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
         verification-data (some (get confidence-score verification-data))
+        none
+    )
+)
+
+(define-read-only (get-batch-verification-request (batch-id uint))
+    (map-get? batch-verification-requests batch-id)
+)
+
+(define-read-only (get-batch-nft-item (batch-id uint) (item-index uint))
+    (map-get? batch-nft-items { batch-id: batch-id, item-index: item-index })
+)
+
+(define-read-only (get-batch-discount-rate)
+    (var-get batch-discount-rate)
+)
+
+(define-read-only (calculate-batch-fee (nft-count uint))
+    (let (
+        (base-fee (var-get verification-fee))
+        (discount-rate (var-get batch-discount-rate))
+        (discount-amount (/ (* base-fee nft-count discount-rate) u100))
+        (total-fee (- (* base-fee nft-count) discount-amount))
+    )
+        total-fee
+    )
+)
+
+(define-read-only (get-batch-progress (batch-id uint))
+    (match (map-get? batch-verification-requests batch-id)
+        batch-data (some {
+            completed: (get completed-count batch-data),
+            total: (get nft-count batch-data),
+            status: (get status batch-data)
+        })
         none
     )
 )
