@@ -1,2 +1,2 @@
-# AI-Generated NFT Verifier
+
 
