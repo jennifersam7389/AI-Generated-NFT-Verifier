@@ -10,6 +10,9 @@
 (define-data-var verification-fee uint u1000000)
 (define-data-var next-batch-id uint u1)
 (define-data-var batch-discount-rate uint u10)
+(define-data-var verification-expiry-period uint u52560)
+(define-data-var renewal-fee uint u500000)
+(define-data-var next-renewal-id uint u1)
 
 (define-map verified-nfts
     { contract-address: principal, token-id: uint }
@@ -20,7 +23,22 @@
         verifier: principal,
         timestamp: uint,
         metadata-hash: (buff 32),
-        is-verified: bool
+        is-verified: bool,
+        expiry-block: uint,
+        renewal-count: uint
+    }
+)
+
+(define-map verification-renewals
+    uint
+    {
+        contract-address: principal,
+        token-id: uint,
+        original-verification-id: uint,
+        renewed-by: principal,
+        renewal-timestamp: uint,
+        new-expiry-block: uint,
+        renewal-fee-paid: uint
     }
 )
 
@@ -165,7 +183,9 @@
                 verifier: tx-sender,
                 timestamp: stacks-block-height,
                 metadata-hash: metadata-hash,
-                is-verified: is-verified
+                is-verified: is-verified,
+                expiry-block: (+ stacks-block-height (var-get verification-expiry-period)),
+                renewal-count: u0
             }
         )
         
@@ -271,7 +291,9 @@
                 verifier: tx-sender,
                 timestamp: stacks-block-height,
                 metadata-hash: metadata-hash,
-                is-verified: is-verified
+                is-verified: is-verified,
+                expiry-block: (+ stacks-block-height (var-get verification-expiry-period)),
+                renewal-count: u0
             }
         )
         
@@ -303,6 +325,54 @@
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (asserts! (<= new-rate u50) ERR_INVALID_METADATA)
         (var-set batch-discount-rate new-rate)
+        (ok true)
+    )
+)
+
+(define-public (renew-verification (contract-address principal) (token-id uint))
+    (let (
+        (verification-data (unwrap! (map-get? verified-nfts { contract-address: contract-address, token-id: token-id }) ERR_NOT_FOUND))
+        (renewal-id (var-get next-renewal-id))
+        (renewal-fee-amount (var-get renewal-fee))
+        (current-block stacks-block-height)
+        (new-expiry (+ current-block (var-get verification-expiry-period)))
+        (current-renewal-count (get renewal-count verification-data))
+    )
+        (asserts! (>= current-block (get expiry-block verification-data)) ERR_VERIFICATION_FAILED)
+        (try! (stx-transfer? renewal-fee-amount tx-sender (as-contract tx-sender)))
+        (map-set verification-renewals renewal-id {
+            contract-address: contract-address,
+            token-id: token-id,
+            original-verification-id: (get verification-id verification-data),
+            renewed-by: tx-sender,
+            renewal-timestamp: current-block,
+            new-expiry-block: new-expiry,
+            renewal-fee-paid: renewal-fee-amount
+        })
+        (map-set verified-nfts { contract-address: contract-address, token-id: token-id }
+            (merge verification-data { 
+                expiry-block: new-expiry,
+                renewal-count: (+ current-renewal-count u1)
+            })
+        )
+        (var-set next-renewal-id (+ renewal-id u1))
+        (ok renewal-id)
+    )
+)
+
+(define-public (update-expiry-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-period u1440) (<= new-period u525600)) ERR_INVALID_METADATA)
+        (var-set verification-expiry-period new-period)
+        (ok true)
+    )
+)
+
+(define-public (update-renewal-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set renewal-fee new-fee)
         (ok true)
     )
 )
@@ -409,5 +479,48 @@
             status: (get status batch-data)
         })
         none
+    )
+)
+
+(define-read-only (is-verification-expired (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (>= stacks-block-height (get expiry-block verification-data))
+        true
+    )
+)
+
+(define-read-only (get-verification-expiry (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (some (get expiry-block verification-data))
+        none
+    )
+)
+
+(define-read-only (get-renewal-history (renewal-id uint))
+    (map-get? verification-renewals renewal-id)
+)
+
+(define-read-only (get-verification-renewal-count (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (get renewal-count verification-data)
+        u0
+    )
+)
+
+(define-read-only (get-expiry-period)
+    (var-get verification-expiry-period)
+)
+
+(define-read-only (get-renewal-fee)
+    (var-get renewal-fee)
+)
+
+(define-read-only (is-verification-current (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (and 
+            (get is-verified verification-data)
+            (< stacks-block-height (get expiry-block verification-data))
+        )
+        false
     )
 )
