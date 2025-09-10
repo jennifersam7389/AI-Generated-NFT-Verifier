@@ -5,6 +5,8 @@
 (define-constant ERR_INVALID_METADATA (err u103))
 (define-constant ERR_VERIFICATION_FAILED (err u104))
 (define-constant ERR_INVALID_AI_MODEL (err u105))
+(define-constant ERR_DISPUTE_EXPIRED (err u106))
+(define-constant ERR_INSUFFICIENT_BOND (err u107))
 
 (define-data-var next-verification-id uint u1)
 (define-data-var verification-fee uint u1000000)
@@ -13,6 +15,9 @@
 (define-data-var verification-expiry-period uint u52560)
 (define-data-var renewal-fee uint u500000)
 (define-data-var next-renewal-id uint u1)
+(define-data-var next-dispute-id uint u1)
+(define-data-var dispute-bond uint u2000000)
+(define-data-var dispute-period uint u1440)
 
 (define-map verified-nfts
     { contract-address: principal, token-id: uint }
@@ -39,6 +44,23 @@
         renewal-timestamp: uint,
         new-expiry-block: uint,
         renewal-fee-paid: uint
+    }
+)
+
+(define-map verification-disputes
+    uint
+    {
+        contract-address: principal,
+        token-id: uint,
+        verification-id: uint,
+        disputer: principal,
+        evidence-hash: (buff 32),
+        dispute-reason: (string-ascii 200),
+        bond-amount: uint,
+        dispute-timestamp: uint,
+        status: (string-ascii 20),
+        resolution-timestamp: uint,
+        resolved-by: principal
     }
 )
 
@@ -377,6 +399,109 @@
     )
 )
 
+(define-public (submit-verification-dispute (contract-address principal) (token-id uint) (evidence-hash (buff 32)) (dispute-reason (string-ascii 200)))
+    (let (
+        (verification-data (unwrap! (map-get? verified-nfts { contract-address: contract-address, token-id: token-id }) ERR_NOT_FOUND))
+        (dispute-id (var-get next-dispute-id))
+        (bond-amount (var-get dispute-bond))
+        (dispute-deadline (+ (get timestamp verification-data) (var-get dispute-period)))
+        (current-block stacks-block-height)
+    )
+        (asserts! (get is-verified verification-data) ERR_VERIFICATION_FAILED)
+        (asserts! (<= current-block dispute-deadline) ERR_DISPUTE_EXPIRED)
+        (asserts! (not (is-eq tx-sender (get verifier verification-data))) ERR_UNAUTHORIZED)
+        (try! (stx-transfer? bond-amount tx-sender (as-contract tx-sender)))
+        (map-set verification-disputes dispute-id {
+            contract-address: contract-address,
+            token-id: token-id,
+            verification-id: (get verification-id verification-data),
+            disputer: tx-sender,
+            evidence-hash: evidence-hash,
+            dispute-reason: dispute-reason,
+            bond-amount: bond-amount,
+            dispute-timestamp: current-block,
+            status: "pending",
+            resolution-timestamp: u0,
+            resolved-by: (as-contract tx-sender)
+        })
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (is-dispute-valid bool))
+    (let (
+        (dispute-data (unwrap! (map-get? verification-disputes dispute-id) ERR_NOT_FOUND))
+        (verification-data (unwrap! (map-get? verified-nfts { contract-address: (get contract-address dispute-data), token-id: (get token-id dispute-data) }) ERR_NOT_FOUND))
+        (verifier-data (default-to 
+            { reputation-score: u0, total-verifications: u0, successful-verifications: u0, is-certified: false, certification-date: u0 }
+            (map-get? verifier-credentials (get verifier verification-data))
+        ))
+        (disputer (get disputer dispute-data))
+        (bond-amount (get bond-amount dispute-data))
+        (verifier (get verifier verification-data))
+    )
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "pending") ERR_VERIFICATION_FAILED)
+        (if is-dispute-valid
+            (begin
+                (try! (as-contract (stx-transfer? bond-amount tx-sender disputer)))
+                (map-set verified-nfts { contract-address: (get contract-address dispute-data), token-id: (get token-id dispute-data) }
+                    (merge verification-data { is-verified: false })
+                )
+                (map-set verifier-credentials verifier {
+                    reputation-score: (if (>= (get reputation-score verifier-data) u10) (- (get reputation-score verifier-data) u10) u0),
+                    total-verifications: (get total-verifications verifier-data),
+                    successful-verifications: (get successful-verifications verifier-data),
+                    is-certified: (get is-certified verifier-data),
+                    certification-date: (get certification-date verifier-data)
+                })
+                (map-set verification-disputes dispute-id 
+                    (merge dispute-data { 
+                        status: "upheld",
+                        resolution-timestamp: stacks-block-height,
+                        resolved-by: tx-sender
+                    })
+                )
+            )
+            (begin
+                (map-set verification-disputes dispute-id 
+                    (merge dispute-data { 
+                        status: "rejected",
+                        resolution-timestamp: stacks-block-height,
+                        resolved-by: tx-sender
+                    })
+                )
+                (map-set verifier-credentials verifier {
+                    reputation-score: (+ (get reputation-score verifier-data) u5),
+                    total-verifications: (get total-verifications verifier-data),
+                    successful-verifications: (get successful-verifications verifier-data),
+                    is-certified: (get is-certified verifier-data),
+                    certification-date: (get certification-date verifier-data)
+                })
+            )
+        )
+        (ok is-dispute-valid)
+    )
+)
+
+(define-public (update-dispute-bond (new-bond uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set dispute-bond new-bond)
+        (ok true)
+    )
+)
+
+(define-public (update-dispute-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-period u144) (<= new-period u10080)) ERR_INVALID_METADATA)
+        (var-set dispute-period new-period)
+        (ok true)
+    )
+)
+
 (define-public (update-verification-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -522,5 +647,42 @@
             (< stacks-block-height (get expiry-block verification-data))
         )
         false
+    )
+)
+
+(define-read-only (get-dispute-info (dispute-id uint))
+    (map-get? verification-disputes dispute-id)
+)
+
+(define-read-only (is-dispute-period-active (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (<= stacks-block-height (+ (get timestamp verification-data) (var-get dispute-period)))
+        false
+    )
+)
+
+(define-read-only (get-dispute-bond)
+    (var-get dispute-bond)
+)
+
+(define-read-only (get-dispute-period)
+    (var-get dispute-period)
+)
+
+(define-read-only (can-submit-dispute (contract-address principal) (token-id uint) (potential-disputer principal))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (and
+            (get is-verified verification-data)
+            (<= stacks-block-height (+ (get timestamp verification-data) (var-get dispute-period)))
+            (not (is-eq potential-disputer (get verifier verification-data)))
+        )
+        false
+    )
+)
+
+(define-read-only (get-dispute-deadline (contract-address principal) (token-id uint))
+    (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
+        verification-data (some (+ (get timestamp verification-data) (var-get dispute-period)))
+        none
     )
 )
