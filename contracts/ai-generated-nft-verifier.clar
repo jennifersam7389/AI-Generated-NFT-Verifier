@@ -7,6 +7,8 @@
 (define-constant ERR_INVALID_AI_MODEL (err u105))
 (define-constant ERR_DISPUTE_EXPIRED (err u106))
 (define-constant ERR_INSUFFICIENT_BOND (err u107))
+(define-constant ERR_ALREADY_VOTED (err u108))
+(define-constant ERR_CONSENSUS_NOT_READY (err u109))
 
 (define-data-var next-verification-id uint u1)
 (define-data-var verification-fee uint u1000000)
@@ -18,6 +20,9 @@
 (define-data-var next-dispute-id uint u1)
 (define-data-var dispute-bond uint u2000000)
 (define-data-var dispute-period uint u1440)
+(define-data-var next-consensus-id uint u1)
+(define-data-var min-consensus-verifiers uint u3)
+(define-data-var consensus-threshold uint u70)
 
 (define-map verified-nfts
     { contract-address: principal, token-id: uint }
@@ -61,6 +66,33 @@
         status: (string-ascii 20),
         resolution-timestamp: uint,
         resolved-by: principal
+    }
+)
+
+(define-map consensus-requests
+    uint
+    {
+        contract-address: principal,
+        token-id: uint,
+        requester: principal,
+        ai-model: (string-ascii 50),
+        metadata-hash: (buff 32),
+        created-at: uint,
+        status: (string-ascii 20),
+        total-votes: uint,
+        weighted-score: uint,
+        total-weight: uint,
+        is-verified: bool
+    }
+)
+
+(define-map consensus-votes
+    { consensus-id: uint, verifier: principal }
+    {
+        confidence-score: uint,
+        vote-weight: uint,
+        voted-at: uint,
+        vote-result: bool
     }
 )
 
@@ -502,6 +534,126 @@
     )
 )
 
+(define-public (request-consensus-verification (contract-address principal) (token-id uint) (ai-model (string-ascii 50)) (metadata-hash (buff 32)))
+    (let (
+        (consensus-id (var-get next-consensus-id))
+        (fee (var-get verification-fee))
+        (current-block stacks-block-height)
+    )
+        (asserts! (is-some (map-get? ai-models ai-model)) ERR_INVALID_AI_MODEL)
+        (asserts! (is-none (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })) ERR_ALREADY_EXISTS)
+        (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+        (map-set consensus-requests consensus-id {
+            contract-address: contract-address,
+            token-id: token-id,
+            requester: tx-sender,
+            ai-model: ai-model,
+            metadata-hash: metadata-hash,
+            created-at: current-block,
+            status: "pending",
+            total-votes: u0,
+            weighted-score: u0,
+            total-weight: u0,
+            is-verified: false
+        })
+        (var-set next-consensus-id (+ consensus-id u1))
+        (ok consensus-id)
+    )
+)
+
+(define-public (submit-consensus-vote (consensus-id uint) (confidence-score uint))
+    (let (
+        (consensus-data (unwrap! (map-get? consensus-requests consensus-id) ERR_NOT_FOUND))
+        (verifier-data (unwrap! (map-get? verifier-credentials tx-sender) ERR_UNAUTHORIZED))
+        (model-data (unwrap! (map-get? ai-models (get ai-model consensus-data)) ERR_INVALID_AI_MODEL))
+        (vote-weight (+ (get reputation-score verifier-data) u1))
+        (is-vote-verified (>= confidence-score (get accuracy-threshold model-data)))
+        (weighted-vote (if is-vote-verified (* confidence-score vote-weight) u0))
+        (new-weighted-score (+ (get weighted-score consensus-data) weighted-vote))
+        (new-total-weight (+ (get total-weight consensus-data) vote-weight))
+        (new-total-votes (+ (get total-votes consensus-data) u1))
+    )
+        (asserts! (get is-certified verifier-data) ERR_UNAUTHORIZED)
+        (asserts! (get is-active model-data) ERR_INVALID_AI_MODEL)
+        (asserts! (is-eq (get status consensus-data) "pending") ERR_VERIFICATION_FAILED)
+        (asserts! (is-none (map-get? consensus-votes { consensus-id: consensus-id, verifier: tx-sender })) ERR_ALREADY_VOTED)
+        (asserts! (and (>= confidence-score u0) (<= confidence-score u100)) ERR_INVALID_METADATA)
+        (map-set consensus-votes { consensus-id: consensus-id, verifier: tx-sender } {
+            confidence-score: confidence-score,
+            vote-weight: vote-weight,
+            voted-at: stacks-block-height,
+            vote-result: is-vote-verified
+        })
+        (map-set consensus-requests consensus-id 
+            (merge consensus-data {
+                total-votes: new-total-votes,
+                weighted-score: new-weighted-score,
+                total-weight: new-total-weight
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (finalize-consensus (consensus-id uint))
+    (let (
+        (consensus-data (unwrap! (map-get? consensus-requests consensus-id) ERR_NOT_FOUND))
+        (min-verifiers (var-get min-consensus-verifiers))
+        (threshold (var-get consensus-threshold))
+        (total-votes (get total-votes consensus-data))
+        (weighted-score (get weighted-score consensus-data))
+        (total-weight (get total-weight consensus-data))
+        (avg-score (if (> total-weight u0) (/ (* weighted-score u100) total-weight) u0))
+        (is-verified (>= avg-score threshold))
+        (contract-addr (get contract-address consensus-data))
+        (token-id (get token-id consensus-data))
+        (verification-id (var-get next-verification-id))
+    )
+        (asserts! (>= total-votes min-verifiers) ERR_CONSENSUS_NOT_READY)
+        (asserts! (is-eq (get status consensus-data) "pending") ERR_VERIFICATION_FAILED)
+        (map-set verified-nfts 
+            { contract-address: contract-addr, token-id: token-id }
+            {
+                verification-id: verification-id,
+                ai-model: (get ai-model consensus-data),
+                confidence-score: avg-score,
+                verifier: (get requester consensus-data),
+                timestamp: stacks-block-height,
+                metadata-hash: (get metadata-hash consensus-data),
+                is-verified: is-verified,
+                expiry-block: (+ stacks-block-height (var-get verification-expiry-period)),
+                renewal-count: u0
+            }
+        )
+        (map-set consensus-requests consensus-id 
+            (merge consensus-data { 
+                status: "completed",
+                is-verified: is-verified
+            })
+        )
+        (var-set next-verification-id (+ verification-id u1))
+        (ok is-verified)
+    )
+)
+
+(define-public (update-consensus-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-threshold u50) (<= new-threshold u100)) ERR_INVALID_METADATA)
+        (var-set consensus-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (update-min-consensus-verifiers (new-min uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-min u2) (<= new-min u10)) ERR_INVALID_METADATA)
+        (var-set min-consensus-verifiers new-min)
+        (ok true)
+    )
+)
+
 (define-public (update-verification-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -684,5 +836,48 @@
     (match (map-get? verified-nfts { contract-address: contract-address, token-id: token-id })
         verification-data (some (+ (get timestamp verification-data) (var-get dispute-period)))
         none
+    )
+)
+
+(define-read-only (get-consensus-request (consensus-id uint))
+    (map-get? consensus-requests consensus-id)
+)
+
+(define-read-only (get-consensus-vote (consensus-id uint) (verifier principal))
+    (map-get? consensus-votes { consensus-id: consensus-id, verifier: verifier })
+)
+
+(define-read-only (get-consensus-threshold)
+    (var-get consensus-threshold)
+)
+
+(define-read-only (get-min-consensus-verifiers)
+    (var-get min-consensus-verifiers)
+)
+
+(define-read-only (has-voted-on-consensus (consensus-id uint) (verifier principal))
+    (is-some (map-get? consensus-votes { consensus-id: consensus-id, verifier: verifier }))
+)
+
+(define-read-only (get-consensus-progress (consensus-id uint))
+    (match (map-get? consensus-requests consensus-id)
+        consensus-data (some {
+            total-votes: (get total-votes consensus-data),
+            required-votes: (var-get min-consensus-verifiers),
+            weighted-score: (get weighted-score consensus-data),
+            total-weight: (get total-weight consensus-data),
+            status: (get status consensus-data)
+        })
+        none
+    )
+)
+
+(define-read-only (is-consensus-ready (consensus-id uint))
+    (match (map-get? consensus-requests consensus-id)
+        consensus-data (and
+            (>= (get total-votes consensus-data) (var-get min-consensus-verifiers))
+            (is-eq (get status consensus-data) "pending")
+        )
+        false
     )
 )
