@@ -881,3 +881,74 @@
         false
     )
 )
+
+(define-data-var next-attestation-id uint u1)
+
+(define-map nft-attestations
+    uint
+    {
+        contract-address: principal,
+        token-id: uint,
+        attester: principal,
+        ai-model: (string-ascii 50),
+        confidence-score: uint,
+        statement-hash: (buff 32),
+        attested-at: uint
+    }
+)
+
+(define-map nft-attestation-index
+    { contract-address: principal, token-id: uint, index: uint }
+    { attestation-id: uint }
+)
+
+(define-map nft-attestation-counts
+    { contract-address: principal, token-id: uint }
+    { count: uint }
+)
+
+(define-public (submit-attestation (contract-address principal) (token-id uint) (ai-model (string-ascii 50)) (confidence-score uint) (statement-hash (buff 32)))
+    (let (
+        (verifier-data (unwrap! (map-get? verifier-credentials tx-sender) ERR_UNAUTHORIZED))
+        (model-data (unwrap! (map-get? ai-models ai-model) ERR_INVALID_AI_MODEL))
+        (attestation-id (var-get next-attestation-id))
+        (count-data (default-to { count: u0 } (map-get? nft-attestation-counts { contract-address: contract-address, token-id: token-id })))
+        (current-count (get count count-data))
+        (new-count (+ current-count u1))
+    )
+        (asserts! (get is-certified verifier-data) ERR_UNAUTHORIZED)
+        (asserts! (get is-active model-data) ERR_INVALID_AI_MODEL)
+        (asserts! (and (>= confidence-score u0) (<= confidence-score u100)) ERR_INVALID_METADATA)
+        (map-set nft-attestations attestation-id {
+            contract-address: contract-address,
+            token-id: token-id,
+            attester: tx-sender,
+            ai-model: ai-model,
+            confidence-score: confidence-score,
+            statement-hash: statement-hash,
+            attested-at: stacks-block-height
+        })
+        (map-set nft-attestation-index { contract-address: contract-address, token-id: token-id, index: current-count } { attestation-id: attestation-id })
+        (map-set nft-attestation-counts { contract-address: contract-address, token-id: token-id } { count: new-count })
+        (var-set next-attestation-id (+ attestation-id u1))
+        (ok attestation-id)
+    )
+)
+
+(define-read-only (get-attestation (attestation-id uint))
+    (map-get? nft-attestations attestation-id)
+)
+
+(define-read-only (get-attestation-count (contract-address principal) (token-id uint))
+    (match (map-get? nft-attestation-counts { contract-address: contract-address, token-id: token-id })
+        data (get count data)
+        u0
+    )
+)
+
+(define-read-only (get-attestation-by-index (contract-address principal) (token-id uint) (index uint))
+    (match (map-get? nft-attestation-index { contract-address: contract-address, token-id: token-id, index: index })
+        idx-data (map-get? nft-attestations (get attestation-id idx-data))
+        none
+    )
+)
